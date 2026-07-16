@@ -285,7 +285,10 @@ class TestUtils(TestCase):
 
 def has_supported_gpu():
     """Check if any GPU platform with Triton support is available."""
-    return torch.xpu.is_available() or SM80OrLater or torch.version.hip
+    return (
+        torch.xpu.is_available() or _is_privateuse1_backend_available()
+        or SM80OrLater or torch.version.hip
+    )
 
 
 class TestAnalysis(TestCase):
@@ -644,10 +647,7 @@ class TestAnalysis(TestCase):
 
         # Verify device properties are present
         self.assertIn("deviceProperties", combined_profile)
-        # XPU currently does not have the deviceProperties like CUDA.
-        # See https://github.com/intel/torch-xpu-ops/issues/2247
-        if torch.cuda.is_available():
-            self.assertGreater(len(combined_profile["deviceProperties"]), 0)
+        self.assertGreater(len(combined_profile["deviceProperties"]), 0)
 
         # Verify some trace events from each original profile are present
         combined_event_names = {
