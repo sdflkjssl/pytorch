@@ -18,7 +18,15 @@ from torch._inductor.codegen.simd import SIMDScheduling
 from torch._inductor.codegen.triton import TritonScheduling
 from torch._inductor.graph import GraphLowering
 from torch._inductor.invert_expr_analysis import generate_inverse_formula
-from torch._inductor.scheduler import _LoopMutationTracker, Scheduler, SchedulerNode
+from torch._inductor.scheduler import (
+    _LoopMutationTracker,
+    _LoopStateSnapshot,
+    _ReindexingMemoryBaseline,
+    _ReindexingPlan,
+    Scheduler,
+    SchedulerNode,
+    TilingAndMemoryMetrics,
+)
 from torch._inductor.test_case import run_tests, TestCase
 from torch._inductor.test_operators import realize
 from torch._inductor.utils import is_big_gpu, run_and_get_code, sympy_index_symbol
@@ -75,6 +83,7 @@ class MockSchedulerTest(TestCase):
 
 
 @inductor_config.patch(loop_ordering_after_fusion=True)
+@instantiate_parametrized_tests
 class ImplDetailTest(MockSchedulerTest):
     @staticmethod
     def _get_snode_body_sym_prefix(snode):
@@ -323,6 +332,97 @@ class ImplDetailTest(MockSchedulerTest):
             z2 + 49 * z1 + 2401 * ModularIndexing(z3, 1, 64),
         )
 
+    @staticmethod
+    def _make_reindexing_memory_test_case():
+        scheduler = Scheduler.__new__(Scheduler)
+        pointwise = mock.Mock()
+        reduction = mock.Mock()
+        pointwise.is_reduction.return_value = False
+        reduction.is_reduction.return_value = True
+        pointwise.get_device.return_value = torch.device(GPU_TYPE)
+        pointwise.get_name.return_value = "pointwise"
+        pointwise.get_nodes.return_value = [pointwise]
+
+        baseline = _ReindexingMemoryBaseline(
+            (
+                TilingAndMemoryMetrics({"x": 1}, {"x": 10}, 10, 0),
+                TilingAndMemoryMetrics({"r0_": 1}, {"r0_": 10}, 10, 0),
+            ),
+            0,
+        )
+        backend = mock.Mock()
+        scheduler.get_backend = mock.Mock(return_value=backend)
+        return scheduler, pointwise, reduction, baseline, backend
+
+    @parametrize(
+        "coalesced,uncoalesced,expected",
+        ((20, 0, False), (4, 1, False), (5, 1, True)),
+    )
+    def test_reindexing_memory_cost_comparison(self, coalesced, uncoalesced, expected):
+        scheduler, pointwise, reduction, baseline, backend = (
+            self._make_reindexing_memory_test_case()
+        )
+        backend.get_tiling_and_memory_metrics.return_value = TilingAndMemoryMetrics(
+            {"x": 1, "r0_": 1},
+            {"x": 10, "r0_": 10},
+            coalesced,
+            uncoalesced,
+        )
+        decision = scheduler._reindexing_regresses_memory_coalescing(
+            pointwise, reduction, baseline
+        )
+        self.assertEqual(decision, expected)
+
+    def test_reindexing_memory_cost_fallback(self):
+        scheduler, pointwise, reduction, baseline, backend = (
+            self._make_reindexing_memory_test_case()
+        )
+        scheduler.score_fusion_memory = mock.Mock(return_value=5)
+        with mock.patch(
+            "torch._inductor.scheduler._uncoalesced_memory_cost", return_value=10
+        ):
+            decision = scheduler._reindexing_regresses_memory_coalescing(
+                pointwise, reduction, _ReindexingMemoryBaseline(None, 0)
+            )
+            self.assertTrue(decision)
+
+            backend.get_tiling_and_memory_metrics.return_value = None
+            decision = scheduler._reindexing_regresses_memory_coalescing(
+                pointwise, reduction, baseline
+            )
+            self.assertTrue(decision)
+
+    def test_reindexing_baseline_restores_candidate(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        pointwise = mock.Mock()
+        reduction = mock.Mock()
+        original_snapshot = mock.Mock()
+        current_snapshot = mock.Mock()
+        plan = _ReindexingPlan(
+            pointwise,
+            (),
+            sympy.S.One,
+            sympy.S.One,
+            original_snapshot,
+        )
+        backend = mock.Mock()
+        backend.get_tiling_and_memory_metrics.return_value = None
+        scheduler.get_backend = mock.Mock(return_value=backend)
+        pointwise.get_nodes.return_value = []
+
+        with mock.patch.object(
+            _LoopStateSnapshot, "create", return_value=current_snapshot
+        ) as create_snapshot:
+            baseline = scheduler._capture_reindexing_memory_baseline(
+                pointwise, reduction, plan
+            )
+
+        create_snapshot.assert_called_once_with((pointwise,))
+        original_snapshot.restore.assert_called_once_with()
+        current_snapshot.restore.assert_called_once_with()
+        self.assertIsNone(baseline.individual_metrics)
+        self.assertEqual(baseline.uncoalesced_cost, 0)
+
 
 @inductor_config.patch(
     {
@@ -331,6 +431,7 @@ class ImplDetailTest(MockSchedulerTest):
         "triton.unique_kernel_names": True,
     }
 )
+@instantiate_parametrized_tests
 class LoopOrderingTest(TestCase):
     device = GPU_TYPE
 
@@ -357,6 +458,41 @@ class LoopOrderingTest(TestCase):
     def setUp(self):
         super().setUp()
         metrics.reset()
+
+    @contextlib.contextmanager
+    def _record_reindexing_memory_decisions(self):
+        decisions = []
+        original = Scheduler._reindexing_regresses_memory_coalescing
+
+        def record(
+            scheduler,
+            node1,
+            node2,
+            baseline,
+        ):
+            backend = scheduler.get_backend(node1.get_device())
+            original_get_metrics = backend.get_tiling_and_memory_metrics
+            combined_metrics = []
+
+            def get_metrics(nodes):
+                metrics = original_get_metrics(nodes)
+                if len(nodes) == 2:
+                    combined_metrics.append(metrics)
+                return metrics
+
+            with mock.patch.object(
+                backend, "get_tiling_and_memory_metrics", get_metrics
+            ):
+                reject = original(scheduler, node1, node2, baseline)
+            metrics = combined_metrics[-1] if combined_metrics else None
+            reduction = node1 if node1.is_reduction() else node2
+            decisions.append((tuple(reduction.group[1]), reject, metrics))
+            return reject
+
+        with mock.patch.object(
+            Scheduler, "_reindexing_regresses_memory_coalescing", record
+        ):
+            yield decisions
 
     def test_for_reordering_reindex(self):
         """
@@ -569,6 +705,7 @@ class LoopOrderingTest(TestCase):
             optf = torch.compile(f)
             print(f"ms={do_bench(lambda: optf(x))}")
 
+    @inductor_config.patch("triton.coalesce_tiling_analysis", True)
     def test_reshape_reindexing_transposed_input(self):
         """
         Same RMS norm pattern but with a transposed input. The reshape
@@ -586,14 +723,29 @@ class LoopOrderingTest(TestCase):
             x_normed = x_f32 * torch.rsqrt(variance + 1e-5)
             return x_normed.reshape(M, N).to(x.dtype)
 
-        M = 16
+        M, N = 16, 8192
         # Transposed input: shape [M, 8192] but stride (1, M)
-        x = torch.randn(8192, M, dtype=torch.bfloat16).T
+        x = torch.randn(N, M, dtype=torch.bfloat16).T
 
         ref = f(x)
-        actual = torch.compile(f)(x)
+        with self._record_reindexing_memory_decisions() as decisions:
+            actual = torch.compile(f)(x)
         torch.testing.assert_close(actual, ref, atol=1e-2, rtol=1e-2)
         self.assertEqual(1, metrics.generated_kernel_count)
+        target_group = (M * (N // 128), 128)
+        target_decisions = [
+            (reject, memory_metrics)
+            for group, reject, memory_metrics in decisions
+            if group == target_group
+        ]
+        self.assertTrue(
+            any(
+                not reject
+                and memory_metrics is not None
+                and memory_metrics.selected_tiling == {"y": M, "x": 64, "r0_": 128}
+                for reject, memory_metrics in target_decisions
+            )
+        )
 
     @inductor_config.patch("loop_ordering_after_fusion", False)
     def test_reshape_reindexing_without_loop_ordering(self):
@@ -763,6 +915,59 @@ class LoopOrderingTest(TestCase):
         self.assertTrue(same(expect, actual, tol=1e-2))
         # variance reduction + block reduction = 2 kernels
         self.assertEqual(2, metrics.generated_kernel_count)
+
+    @parametrize("coalesce_analysis", (False, True))
+    def test_upsample_into_reduction_keeps_coalesced_loops(self, coalesce_analysis):
+        """Reindexing upsample onto GroupNorm's split loses coalescing (#189488)."""
+
+        class Mod(nn.Module):
+            def __init__(self, channels, groups):
+                super().__init__()
+                self.conv = nn.Conv2d(channels, channels, 3, padding=1)
+                self.norm = nn.GroupNorm(groups, channels, eps=1e-6)
+                self.skip = nn.Conv2d(channels, channels, 1)
+
+            def forward(self, x, residual):
+                x = (x + residual) / 1.41421356237
+                x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+                x = self.conv(x)
+                y = F.silu(self.norm(x))
+                return y + (self.skip(x) * 0.01)
+
+        batch, channels, groups, spatial = 8, 128, 32, 64
+        mod = Mod(channels, groups).eval()
+        x = torch.randn(batch, channels, spatial // 2, spatial // 2)
+        residual = torch.randn_like(x)
+
+        with (
+            torch.no_grad(),
+            inductor_config.patch("triton.coalesce_tiling_analysis", coalesce_analysis),
+            self._record_reindexing_memory_decisions() as decisions,
+        ):
+            self.do_acc_test(mod, x, residual)
+        self.assertEqual(6, metrics.generated_kernel_count)
+        target_group = (batch * groups, (channels // groups) * spatial * spatial)
+        target_decisions = [
+            (reject, memory_metrics)
+            for group, reject, memory_metrics in decisions
+            if group == target_group
+        ]
+        if coalesce_analysis:
+            self.assertTrue(
+                any(
+                    reject
+                    and memory_metrics is not None
+                    and memory_metrics.uncoalesced_memory_cost > 0
+                    for reject, memory_metrics in target_decisions
+                )
+            )
+        else:
+            self.assertTrue(
+                any(
+                    reject and memory_metrics is None
+                    for reject, memory_metrics in target_decisions
+                )
+            )
 
     @inductor_config.patch(
         {
@@ -1303,6 +1508,25 @@ class MemoryCoalescingTest(MockSchedulerTest):
         super().setUp()
         metrics.reset()
 
+    def _check_memory_metrics(self, node, expected_tiling):
+        analysis = node.get_coalesce_analysis()
+        self.assertIsNotNone(analysis)
+        backend = node.scheduler.get_backend(node.get_device())
+        memory_metrics = backend.get_tiling_and_memory_metrics([node])
+        self.assertIsNotNone(memory_metrics)
+        self.assertEqual(list(memory_metrics.selected_tiling), expected_tiling)
+        self.assertEqual(list(memory_metrics.tiling_scores), expected_tiling)
+
+        selected_cost = sum(memory_metrics.tiling_scores.values())
+        total_cost = sum(analysis.coalesced_by_var.values()) + sum(
+            analysis.uncoalesced_addrs.values()
+        )
+        self.assertEqual(memory_metrics.coalesced_memory_cost, selected_cost)
+        self.assertEqual(
+            memory_metrics.uncoalesced_memory_cost, total_cost - selected_cost
+        )
+        return analysis, memory_metrics
+
     def _create_buffer(self, name, sizes):
         """Create a buffer with specified sizes"""
 
@@ -1625,6 +1849,39 @@ class MemoryCoalescingTest(MockSchedulerTest):
             out = torch.compile(foo)(inp)
             self.assertEqual(out, out_eager)
 
+    def test_reduction_memory_costs_follow_selected_tiling(self):
+        def foo(x, y):
+            return (x + y).sum((1, 3))
+
+        def check_metrics(nodes):
+            self.assertEqual(len(nodes), 1)
+            node = nodes[0]
+            analysis, memory_metrics = self._check_memory_metrics(node, ["x", "r0_"])
+            index_vars = analysis.norm_read_writes.index_vars
+            reduction_vars = analysis.norm_read_writes.reduce_vars
+            self.assertEqual(len(index_vars), 1)
+            self.assertEqual(len(reduction_vars), 2)
+            self.assertGreater(analysis.coalesced_by_var[reduction_vars[0]], 0)
+            self.assertGreater(analysis.coalesced_by_var[reduction_vars[1]], 0)
+
+            self.assertEqual(
+                memory_metrics.tiling_scores["r0_"],
+                analysis.coalesced_by_var[reduction_vars[-1]],
+            )
+            self.assertLess(
+                memory_metrics.tiling_scores["x"],
+                analysis.coalesced_by_var[index_vars[-1]],
+            )
+            return nodes
+
+        x = torch.randn(1, 2, 4, 8, device=GPU_TYPE)
+        y = torch.randn(1, 8, 4, 2, device=GPU_TYPE).permute(0, 3, 2, 1)
+        with (
+            torch._inductor.config.patch(_post_fusion_custom_pass=check_metrics),
+            torch.no_grad(),
+        ):
+            self.assertEqual(torch.compile(foo)(x, y), foo(x, y))
+
     def test_solve_for_zero(self):
         from torch._inductor import tiling_utils
 
@@ -1679,8 +1936,16 @@ class MemoryCoalescingTest(MockSchedulerTest):
         def fn(nodes):
             self.assertTrue(len(nodes) == 1)
 
-            coalesce_analysis = nodes[0].get_coalesce_analysis()
+            node = nodes[0]
+            coalesce_analysis = node.get_coalesce_analysis()
             self.assertEqual(coalesce_analysis.suggested_split.tiling_factor, 64)
+            if not dynamic:
+                expected_tiling = ["y", "x", "r0_"]
+                coalesce_analysis, memory_metrics = self._check_memory_metrics(
+                    node, expected_tiling
+                )
+                suggested_score = coalesce_analysis.suggested_split.score
+                self.assertEqual(memory_metrics.tiling_scores["y"], suggested_score)
             return nodes
 
         with torch._inductor.config.patch(_post_fusion_custom_pass=fn), torch.no_grad():
