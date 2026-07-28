@@ -1295,6 +1295,7 @@ class FlexGemmEpilogueEmitter:
         epilogue_arg_placeholders: tuple[torch.fx.Node, ...] = (),
         *,
         fast_math: bool = False,
+        swap_ab: bool = False,
     ) -> None:
         self.graph_module = graph_module
         self.epilogue_arg_placeholders = epilogue_arg_placeholders
@@ -1309,11 +1310,15 @@ class FlexGemmEpilogueEmitter:
                 "acc", ValueRanges.unknown(), dtype=torch.float32, shape=(1,)
             )
         }
+
         self.grouped_tensors = {
-            node: grouped.layout
+            node: dataclasses.replace(grouped.layout, swapped=swap_ab)
             for node, grouped in analysis.local_reduce.grouped_layouts.items()
         }
-        self.active_grouped_layouts = OrderedSet(analysis.required_geometries)
+        self.active_grouped_layouts = OrderedSet(
+            dataclasses.replace(layout, swapped=swap_ab)
+            for layout in analysis.required_geometries
+        )
         self.store_sources: dict[torch.fx.Node, Any] = {}
         self.physical_reductions: dict[torch.fx.Node, FlexGemmPhysicalReduction] = {}
         self.local_reduce = self.outputs.local_reduce
@@ -1681,6 +1686,7 @@ def materialize_flex_gemm_epilogue(
     epilogue_arg_placeholders: tuple[torch.fx.Node, ...] = (),
     *,
     fast_math: bool = False,
+    swap_ab: bool = False,
 ) -> tuple[str, str]:
     """Materialize an analyzed FlexGEMM body as generated CuTeDSL source.
 
@@ -1691,6 +1697,8 @@ def materialize_flex_gemm_epilogue(
 
     Args:
         graph_module: FlexGEMM body graph containing the GEMM and epilogue nodes.
+        swap_ab: Whether generated local-reduction expressions use QuACK's
+            transposed physical accumulator coordinates.
         gemm_op: GEMM overload expected to occur exactly once in the body.
         analysis: Shared output and local-reduction analysis for the graph.
         epilogue_arg_placeholders: Captured tensor placeholders exposed as
@@ -1709,4 +1717,5 @@ def materialize_flex_gemm_epilogue(
         analysis,
         epilogue_arg_placeholders,
         fast_math=fast_math,
+        swap_ab=swap_ab,
     ).materialize()
