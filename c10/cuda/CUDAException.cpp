@@ -3,17 +3,68 @@
 #include <c10/cuda/CUDADeviceAssertionHost.h>
 #include <c10/util/Exception.h>
 
+#if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
+#include <c10/cuda/driver_api.h>
+#endif
+
+#include <array>
 #include <string>
 #include <utility>
 
 namespace c10::cuda {
+
+CUDAErrorLogCapture::CUDAErrorLogCapture() noexcept {
+#if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED) && \
+    defined(CUDA_VERSION) && (CUDA_VERSION >= 12090)
+  try {
+    auto* api = DriverAPI::get();
+    if (api->cuLogsCurrent_ && api->cuLogsDumpToMemory_) {
+      CUlogIterator iterator{};
+      if (api->cuLogsCurrent_(&iterator, 0) == CUDA_SUCCESS) {
+        iterator_ = iterator;
+        enabled_ = true;
+      }
+    }
+  } catch (...) {
+    return;
+  }
+#endif
+}
+
+std::string CUDAErrorLogCapture::get_error_log_suffix() noexcept {
+#if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED) && \
+    defined(CUDA_VERSION) && (CUDA_VERSION >= 12090)
+  if (!enabled_) {
+    return {};
+  }
+
+  std::array<char, 25600> buffer{};
+  size_t size = buffer.size();
+  auto iterator = static_cast<CUlogIterator>(iterator_);
+  try {
+    auto* api = DriverAPI::get();
+    if (api->cuLogsDumpToMemory_(&iterator, buffer.data(), &size, 0) ==
+            CUDA_SUCCESS &&
+        size > 0 && size <= buffer.size()) {
+      std::string error_log{
+          "\nThe CUDA driver logged these messages, which may provide useful details:\n"};
+      error_log.append(buffer.data(), size);
+      return error_log;
+    }
+  } catch (...) {
+    return {};
+  }
+#endif
+  return {};
+}
 
 void c10_cuda_check_implementation(
     const int32_t err,
     const char* filename,
     const char* function_name,
     const uint32_t line_number,
-    const bool include_device_assertions) {
+    const bool include_device_assertions,
+    CUDAErrorLogCapture* error_log) {
   const auto cuda_error = static_cast<cudaError_t>(err);
   const auto cuda_kernel_failure = include_device_assertions
       ? c10::cuda::CUDAKernelLaunchRegistry::get_singleton_ref().has_failed()
@@ -32,6 +83,9 @@ void c10_cuda_check_implementation(
   check_message.append(error_string);
   check_message.append(c10::cuda::get_cuda_error_help(cuda_error));
   check_message.append(c10::cuda::get_cuda_async_error_suffix(cuda_error));
+  if (error_log) {
+    check_message.append(error_log->get_error_log_suffix());
+  }
   check_message.push_back('\n');
   if (include_device_assertions) {
     check_message.append(c10_retrieve_device_side_assertion_info());
