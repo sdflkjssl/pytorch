@@ -375,6 +375,12 @@ def _cute_call(target: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> An
         raise NotImplementedError(f"unsupported FlexGEMM epilogue op: {target}")
     if op_name in ("mx_e8m0_scale", "nvfp4_e4m3_scale"):
         return _cute_scale_call(op_name, args, kwargs)
+    if op_name == "nvfp4_pack":
+        return V.kernel.cse.generate(
+            V.kernel.body,
+            f"nvfp4_pack_intrinsic({args[0]})",
+            dtype=torch.uint8,
+        )
     try:
         op = getattr(V.get_ops_handler(), op_name)
     except AttributeError:
@@ -510,6 +516,13 @@ class FlexGemmSelectForm:
 
 
 @dataclasses.dataclass(frozen=True)
+class FlexGemmNVFP4PackForm:
+    """Canonical grouped source for one terminal NVFP4 pack."""
+
+    source: torch.fx.Node
+
+
+@dataclasses.dataclass(frozen=True)
 class FlexGemmUnsupportedReductionForm:
     """Record an unsupported reduction source for shared error handling."""
 
@@ -524,6 +537,7 @@ FlexGemmStructuralForm = (
     | FlexGemmGetItemForm
     | FlexGemmSplitForm
     | FlexGemmSelectForm
+    | FlexGemmNVFP4PackForm
     | FlexGemmUnsupportedReductionForm
 )
 
@@ -649,6 +663,13 @@ def flex_gemm_structural_form(
             canonical_shape,
             grouped_tensor_layout_match(canonical_shape, tensor_meta_shape(source)),
         )
+    if node.target is torch.ops.flex_gemm.nvfp4_pack.default:
+        source = node.args[0]
+        if not isinstance(source, torch.fx.Node):
+            raise AssertionError(
+                f"malformed FlexGEMM output transform: {node.format_node()}"
+            )
+        return FlexGemmNVFP4PackForm(source)
     if node.target in FUNCTION_REDUCTION_TYPES:
         source = node.args[0]
         if not isinstance(source, torch.fx.Node):

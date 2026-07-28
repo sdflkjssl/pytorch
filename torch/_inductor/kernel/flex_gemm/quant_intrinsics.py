@@ -1,10 +1,9 @@
-"""Exact E8M0 conversion for FlexGEMM quantization epilogues.
+"""Packed low-precision conversions for FlexGEMM quantization epilogues.
 
-CuTeDSL's public conversion neither exposes FLOOR rounding nor handles every
-TensorSSA fragment width needed by FlexGEMM. These helpers emit the packed SM100
-instructions directly and rebuild the original fragment. Edge-case probes match
-the eager custom op and TorchAO's compiled RCEIL path bit-for-bit, while matched
-fused benchmarks showed no material performance regression.
+CuTeDSL's public E8M0 conversion neither exposes FLOOR rounding nor handles every
+TensorSSA fragment width needed by FlexGEMM. NVFP4 uses its native packed E2M1
+conversion directly; pre-rounding through pointwise selects produces equivalent
+finite values with substantially worse code generation.
 """
 
 import functools
@@ -23,6 +22,13 @@ from cutlass.cutlass_dsl import dsl_user_op, T
 def quant_intrinsics_cache_key() -> str:
     """Include this module's source in generated epilogue cache keys."""
     return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+@dsl_user_op
+def nvfp4_pack_intrinsic(source, *, loc=None, ip=None):
+    """Round paired Float32 values with SM100's packed E2M1 conversion."""
+    packed = source.to(cutlass.Float4E2M1FN).bitcast(cutlass.Uint8)
+    return packed.reshape((cute.size(packed.shape), 1, 1))
 
 
 def extract_vector_element(value: ir.Value, index: int) -> ir.Value:
@@ -130,9 +136,7 @@ def mx_e8m0_scale_intrinsic(
     max_power = math.floor(math.log2(max_value))
     scaled = source / max_value if rounding == "rceil" else source * 2.0**-max_power
     floor_inf_value = (
-        2.0 ** (128 - max_power)
-        if rounding == "floor" and max_power > 0
-        else None
+        2.0 ** (128 - max_power) if rounding == "floor" and max_power > 0 else None
     )
 
     if isinstance(scaled, cute.TensorSSA):

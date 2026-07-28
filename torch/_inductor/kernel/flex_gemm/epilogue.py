@@ -50,6 +50,7 @@ from torch._inductor.kernel.flex_gemm.constraints import (
     LOCAL_REDUCE_SINGLE_PHYSICAL_FINALIZE_ERROR,
     LOCAL_REDUCE_SOURCE_EXPRESSION_ERROR,
     local_reduce_unsupported_tensorssa_error,
+    statically_known_equal,
     statically_known_shape_equal,
     validate_local_reduce_feed_main_capability,
     validate_local_reduce_tensorssa_group_size,
@@ -63,6 +64,7 @@ from torch._inductor.kernel.flex_gemm.quack_reductions import (
     flex_gemm_structural_form,
     FlexGemmGetItemForm,
     FlexGemmGroupedLayoutMatch,
+    FlexGemmNVFP4PackForm,
     FlexGemmPhysicalReduction,
     FlexGemmPrepareSoftmaxForm,
     FlexGemmReductionForm,
@@ -982,6 +984,30 @@ def match_grouped_main_lane(
             structural_values=(split_size,),
         )
 
+    if isinstance(form, FlexGemmNVFP4PackForm):
+        grouped = form.source
+        view_form = local_reduce.graph.structural_forms.get(grouped)
+        shape = tensor_meta_shape(grouped)
+        group = 2
+        if (
+            not isinstance(view_form, FlexGemmViewForm)
+            or shape is None
+            or len(shape) != 3
+            or not statically_known_equal(shape[-1], group)
+            or not statically_known_shape_equal(
+                (shape[0], shape[1] * group), gemm_shape
+            )
+            or not local_reduce.graph.depends_on(view_form.source, gemm)
+        ):
+            return None
+        return GroupedMainLaneMatch(
+            source=view_form.source,
+            group=group,
+            chunked=False,
+            indices=tuple(range(group)),
+            layout_node=grouped,
+        )
+
     if not isinstance(form, FlexGemmSelectForm):
         return None
     view = form.source
@@ -1629,6 +1655,7 @@ class FlexGemmEpilogueEmitter:
             "from cutlass._mlir_helpers import math as cutlass_math\n"
             "from torch._inductor.kernel.flex_gemm.quant_intrinsics import (\n"
             "    mx_e8m0_scale_intrinsic,\n"
+            "    nvfp4_pack_intrinsic,\n"
             ")\n\n"
             f"{local_reduce_source}"
             f"@cute.jit\ndef {name}({epilogue_params}):\n"
