@@ -591,6 +591,59 @@ class TestCuptiRecords(TestCase):
         # stream 5 still has non-reassigned work (k14), so its annotation is kept there
         self.assertEqual(by_name["reduce_scatter"]["tid"], 5)
 
+    def test_graph_dependency_flows_json(self):
+        # CUDA-graph node->node dependency arrows in the JSON export: one flow (predecessor end
+        # -> successor start) per edge, resolved within the same replay (correlation_id) so
+        # arrows never cross replays, drawn on the ops' display lanes. No CUDA.
+        from torch.profiler._cupti.monitor_trace import _graph_dependency_flow_events
+
+        # replay 100: node 11 on lane 7 [1000,2000]; node 12 on lane 8 [3000,4000], 12 -> 11.
+        # replay 200 repeats the same nodes and must stay self-contained.
+        node_rows = [
+            (100, 11, 0, 7, 1000, 2000),
+            (100, 12, 0, 8, 3000, 4000),
+            (200, 11, 0, 7, 5000, 6000),
+            (200, 12, 0, 8, 7000, 8000),
+        ]
+        events = _graph_dependency_flow_events(node_rows, {12: [11]}, base_ns=0)
+        starts = [e for e in events if e["ph"] == "s"]
+        fins = [e for e in events if e["ph"] == "f"]
+        self.assertEqual(len(starts), 2)  # one edge per replay
+        self.assertEqual(len(fins), 2)
+        s0 = starts[0]
+        f0 = next(f for f in fins if f["id"] == s0["id"])
+        # arrow leaves the predecessor's end on its lane and lands on the successor's start
+        self.assertEqual((s0["tid"], s0["ts"]), (7, 2.0))
+        self.assertEqual((f0["tid"], f0["ts"], f0["bp"]), (8, 3.0, "e"))
+        self.assertNotEqual(
+            starts[0]["id"], starts[1]["id"]
+        )  # replays don't share a flow
+        # no recorded dependencies -> no flows
+        self.assertEqual(_graph_dependency_flow_events(node_rows, {}, base_ns=0), [])
+
+        # Clock skew, small (<= 25% of the successor's execution): predecessor 13 ends at 3600,
+        # 100ns into successor 14 ([3500,4500], 1000ns). The successor landing (flow finish)
+        # clamps up to the predecessor end so the arrow renders forward.
+        small = [
+            (300, 13, 0, 7, 1000, 3600),
+            (300, 14, 0, 8, 3500, 4500),
+        ]
+        ev = _graph_dependency_flow_events(small, {14: [13]}, base_ns=0)
+        s = next(e for e in ev if e["ph"] == "s")
+        f = next(e for e in ev if e["ph"] == "f")
+        self.assertEqual(s["ts"], 3.6)  # flow start stays at the predecessor end
+        self.assertEqual(f["ts"], 3.6)  # successor clamped up to it -> forward
+        # Clock skew, large (> 25% of the successor's execution): predecessor 15 ends 500ns into
+        # successor 16 -- too much to clamp, so the finish is left at the successor start.
+        large = [
+            (400, 15, 0, 7, 1000, 4000),
+            (400, 16, 0, 8, 3500, 4500),
+        ]
+        ev = _graph_dependency_flow_events(large, {16: [15]}, base_ns=0)
+        s = next(e for e in ev if e["ph"] == "s")
+        f = next(e for e in ev if e["ph"] == "f")
+        self.assertEqual((s["ts"], f["ts"]), (4.0, 3.5))  # unclamped
+
     def test_chrome_counter_events_from_pm(self):
         # PM counters render as chrome "C" (counter) events in a dedicated per-device
         # "GPU N Counters" process row, separate from the GPU kernel work. No CUDA.
