@@ -3294,6 +3294,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.prologue: IndentedBuffer = IndentedBuffer()
         self.post_loop_combine: IndentedBuffer = IndentedBuffer()
         self.post_loop_store: IndentedBuffer = IndentedBuffer()
+        self._named_constants: dict[str, tuple[str, bool]] = {}
         self.outside_loop_vars = OrderedSet[Any]()
         self.min_elem_per_thread = min_elem_per_thread
         self.block_ptr_id = itertools.count()
@@ -7770,6 +7771,22 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         rindex = self._flatten_reduction_indices(rn_inds)
         buffer.splice(f"rindex = {self.index_to_str(rindex)}")
 
+    def _codegen_named_constant(
+        self, sym: sympy.Symbol, expr: sympy.Expr, constexpr: bool
+    ) -> None:
+        name = str(sym)
+        value = (self.index_to_str(expr), constexpr)
+        existing = self._named_constants.get(name)
+        if existing is not None:
+            if existing != value:
+                raise AssertionError(
+                    f"conflicting definitions for named constant {sym}"
+                )
+            return
+        self._named_constants[name] = value
+        annotation = ": tl.constexpr" if constexpr else ""
+        self.body.writeline(f"{name}{annotation} = {value[0]}")
+
     def iteration_ranges_codegen_header(
         self,
         entry: IterationRangesRoot,
@@ -7785,8 +7802,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     "derived reduction roots do not support cooperative reductions"
                 )
             for sym, expr, constexpr in entry.named_constants():
-                annotation = ": tl.constexpr" if constexpr else ""
-                code.writeline(f"{sym}{annotation} = {self.index_to_str(expr)}")
+                self._codegen_named_constant(sym, expr, constexpr)
             code.writeline(
                 f"{entry.name} = {self.index_to_str(entry.block_offset())} + "
                 f"{self.iteration_ranges_ranges_code(entry)}"

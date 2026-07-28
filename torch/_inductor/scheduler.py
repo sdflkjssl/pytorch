@@ -560,9 +560,9 @@ class NestedReduction:
         """
         Where a pointwise node runs in the nested pipeline.
 
-        The local reduction stage has three meaningful domains: its reduced
+        The local reduction stage has four meaningful domains: its reduced
         output, its input before reducing the local lane, and the outer
-        reduction's parent tile after broadcast-back.
+        reduction's full and half parent tiles after broadcast-back.
         """
 
         # Local reduction output, e.g. [B, D // G].
@@ -571,6 +571,10 @@ class NestedReduction:
         LOCAL_REDUCTION_INPUT = enum.auto()
         # Outer reduction tile after broadcast-back, e.g. [B, D].
         PARENT_FULL = enum.auto()
+        # Parent tile with the grouped axis packed two lanes at a time.
+        PARENT_HALF = enum.auto()
+
+    PARENT_HALF_FACTOR = 2
 
     class GroupedAxis(enum.Enum):
         R = enum.auto()
@@ -588,6 +592,22 @@ class NestedReduction:
         grouped_rnumel: sympy.Expr
         local_reduction_domain: tuple[sympy.Expr, ...]
         parent_full_domain: tuple[sympy.Expr, ...]
+        parent_half_domain: tuple[sympy.Expr, ...] | None = None
+
+    @classmethod
+    def _parent_half_domain(
+        cls,
+        grouped_axis: GroupedAxis,
+        group_size: int,
+        outer_numel: sympy.Expr,
+        outer_rnumel: sympy.Expr,
+    ) -> tuple[sympy.Expr, ...] | None:
+        if (
+            grouped_axis is not cls.GroupedAxis.R
+            or group_size % cls.PARENT_HALF_FACTOR != 0
+        ):
+            return None
+        return (outer_numel, FloorDiv(outer_rnumel, cls.PARENT_HALF_FACTOR))
 
     @dataclasses.dataclass(frozen=True)
     class SubParentEpiloguePlan:
@@ -1079,6 +1099,7 @@ class NestedReduction:
         full_numel = V.graph.sizevars.simplify(
             domain_context.grouped_numel * domain_context.grouped_rnumel
         )
+        has_parent_half_domain = domain_context.parent_half_domain is not None
         pointwise_domains: list[
             tuple[SchedulerNode, NestedReduction.PointwiseDomain]
         ] = []
@@ -1112,6 +1133,14 @@ class NestedReduction:
                 domain = cls.PointwiseDomain.REDUCED
             elif V.graph.sizevars.statically_known_equals(sn_numel, full_numel):
                 domain = full_domain
+            elif (
+                is_consumer
+                and has_parent_half_domain
+                and V.graph.sizevars.statically_known_equals(
+                    cls.PARENT_HALF_FACTOR * sn_numel, full_numel
+                )
+            ):
+                domain = cls.PointwiseDomain.PARENT_HALF
             else:
                 return None
             pointwise_domains.append((sn, domain))
@@ -1139,6 +1168,7 @@ class NestedReduction:
 
         iter_ranges, _ = domain_context.grouped_reduction.get_ranges()
         _, (sn_numel, _) = sn.group
+        expected_numel: sympy.Expr | None
         if domain is cls.PointwiseDomain.REDUCED:
             expected_numel = domain_context.grouped_numel
             expected_groups: Sequence[sympy.Expr] = tuple(iter_ranges)
@@ -1147,13 +1177,18 @@ class NestedReduction:
                 domain_context.grouped_numel * domain_context.grouped_rnumel
             )
             expected_groups = domain_context.local_reduction_domain
-        else:
-            if domain is not cls.PointwiseDomain.PARENT_FULL:
-                raise AssertionError(f"expected PARENT_FULL domain, got {domain}")
+        elif domain is cls.PointwiseDomain.PARENT_FULL:
             expected_numel = V.graph.sizevars.simplify(
                 domain_context.grouped_numel * domain_context.grouped_rnumel
             )
             expected_groups = domain_context.parent_full_domain
+        elif domain is cls.PointwiseDomain.PARENT_HALF:
+            if domain_context.parent_half_domain is None:
+                return False
+            expected_groups = domain_context.parent_half_domain
+            expected_numel = sympy_product(expected_groups)
+        else:
+            raise AssertionError(f"unexpected pointwise domain: {domain}")
         return V.graph.sizevars.statically_known_equals(
             sn_numel, expected_numel
         ) and SIMDKernel.is_compatible(expected_groups, sn.get_ranges())
@@ -1306,12 +1341,19 @@ class NestedReduction:
         ):
             return False
         iter_ranges, reduce_ranges = grouped_reduction.get_ranges()
+        parent_half_domain = cls._parent_half_domain(
+            grouped_axis,
+            group_size_int,
+            outer_numel,
+            outer_rnumel,
+        )
         domain_context = cls.PointwiseDomainContext(
             grouped_reduction=grouped_reduction,
             grouped_numel=grouped_numel,
             grouped_rnumel=grouped_rnumel,
             local_reduction_domain=(*iter_ranges, *reduce_ranges),
             parent_full_domain=(outer_numel, outer_rnumel),
+            parent_half_domain=parent_half_domain,
         )
         if not cls._pointwise_nodes_match_nested_domains(
             outer_node,
@@ -3465,6 +3507,12 @@ class FusedNestedReductions(FusedSchedulerNode):
         self.grouped_axis: NestedReduction.GroupedAxis = grouped_axis
         self.group_size_in_r: bool = self.grouped_axis is NestedReduction.GroupedAxis.R
         iter_ranges, reduce_ranges = grouped_reduction.get_ranges()
+        parent_half_domain = NestedReduction._parent_half_domain(
+            grouped_axis,
+            int(exact_group_size),
+            outer_numel,
+            outer_rnumel,
+        )
         self.domain_context: NestedReduction.PointwiseDomainContext = (
             NestedReduction.PointwiseDomainContext(
                 grouped_reduction=grouped_reduction,
@@ -3472,14 +3520,25 @@ class FusedNestedReductions(FusedSchedulerNode):
                 grouped_rnumel=grouped_rnumel,
                 local_reduction_domain=(*iter_ranges, *reduce_ranges),
                 parent_full_domain=(outer_numel, outer_rnumel),
+                parent_half_domain=parent_half_domain,
             )
         )
+        grouped_pointwise_domains = NestedReduction._classify_grouped_pointwise_nodes(
+            self.domain_context,
+            self.node2.get_nodes(),
+        )
+        if grouped_pointwise_domains is None:
+            raise AssertionError("expected grouped pointwise domains to be classified")
+        self.grouped_pointwise_domains: tuple[
+            tuple[SchedulerNode, NestedReduction.PointwiseDomain], ...
+        ] = tuple(grouped_pointwise_domains)
 
     def can_fuse_with(self, other: BaseSchedulerNode, *, can_reorder: bool) -> bool:
         """Allow downstream pointwise of the grouped reduction to fuse in.
 
-        Consumers fused directly into the grouped reduction must run at either
-        reduced-output resolution or full parent-tile resolution.
+        Consumers fused directly into the grouped reduction must run at
+        reduced-output, full parent-tile, or supported half parent-tile
+        resolution.
         """
         if other.is_reduction():
             return False
@@ -3507,12 +3566,109 @@ class FusedNestedReductions(FusedSchedulerNode):
             for _, domain in pointwise_domains
         ):
             return False
+        half_resolution_nodes = [
+            sn
+            for sn, domain in pointwise_domains
+            if domain is NestedReduction.PointwiseDomain.PARENT_HALF
+        ]
+        # A sub-parent epilogue node's stores are emitted last, so any other
+        # fused node that reads its output buffer would load it before that store
+        # (read-before-write hazard). Same-stage half-resolution consumers are
+        # safe -- they reuse the value in-register -- so only non-half consumers
+        # that read a half-resolution output buffer are rejected. Checking the
+        # whole combined set makes this independent of fusion order.
+        combined_nodes = [*self.node2.get_nodes(), *other.get_nodes()]
+        candidate_half_resolution_nodes: list[SchedulerNode] | None = None
+        candidate_domains = NestedReduction._classify_grouped_pointwise_nodes(
+            self.domain_context,
+            combined_nodes,
+        )
+        if candidate_domains is None:
+            if any(
+                domain is NestedReduction.PointwiseDomain.PARENT_HALF
+                for _, domain in [*self.grouped_pointwise_domains, *pointwise_domains]
+            ):
+                return False
+        else:
+            candidate_half_resolution_nodes = [
+                sn
+                for sn, domain in candidate_domains
+                if domain is NestedReduction.PointwiseDomain.PARENT_HALF
+            ]
+            if not NestedReduction._sub_parent_epilogue_outputs_unread(
+                combined_nodes,
+                OrderedSet(candidate_half_resolution_nodes),
+                self.scheduler.mutation_renames,
+            ):
+                return False
+
+        if half_resolution_nodes:
+            if candidate_half_resolution_nodes is None:
+                return False
+            if (
+                self._parent_half_source_layouts(
+                    candidate_half_resolution_nodes,
+                    combined_nodes,
+                )
+                is None
+            ):
+                return False
+            return self.scheduler._can_fuse_nested_reduction_append(
+                self.node2,
+                other,
+                pointwise_domains,
+                can_reorder=can_reorder,
+                producer_node=self,
+            )
         return self.scheduler._can_fuse_nested_reduction_append(
             self.node2,
             other,
             pointwise_domains,
             can_reorder=can_reorder,
         )
+
+    def _parent_half_source_layouts(
+        self,
+        half_nodes: Sequence[SchedulerNode],
+        all_grouped_nodes: Sequence[BaseSchedulerNode],
+    ) -> dict[str, NestedReduction.SubParentSourceLayout] | None:
+        renames = self.scheduler.mutation_renames
+        fused_buffer_names = OrderedSet(
+            renames.get(name, name) for name in self.get_buffer_names()
+        )
+        fullres_numel = V.graph.sizevars.simplify(
+            self.domain_context.grouped_numel * self.domain_context.grouped_rnumel
+        )
+        reduction_reads: dict[str, list[MemoryDep]] = collections.defaultdict(list)
+        for raw_dep in self.grouped_reduction.read_writes.reads:
+            if isinstance(raw_dep, MemoryDep):
+                dep = raw_dep.rename(renames)
+                reduction_reads[dep.name].append(dep)
+
+        source_deps = NestedReduction._sub_parent_epilogue_source_deps(
+            half_nodes,
+            fused_buffer_names,
+            fullres_numel,
+            reduction_reads,
+            NestedReduction.PARENT_HALF_FACTOR,
+            renames,
+        )
+        if source_deps is None:
+            return None
+        if any(
+            layout is not NestedReduction.SubParentSourceLayout.INTERLEAVED
+            for _dep, layout in source_deps
+        ):
+            return None
+        planned_source_deps = tuple(dep for dep, _layout in source_deps)
+        if not NestedReduction._sub_parent_epilogue_source_loads_are_unambiguous(
+            all_grouped_nodes,
+            OrderedSet(half_nodes),
+            planned_source_deps,
+            renames,
+        ):
+            return None
+        return {dep.name: layout for dep, layout in source_deps}
 
     def fuse_with(self, other: BaseSchedulerNode) -> FusedNestedReductions:
         device = self.node2.get_device()
@@ -8229,6 +8385,7 @@ class Scheduler:
         ],
         *,
         can_reorder: bool,
+        producer_node: BaseSchedulerNode | None = None,
     ) -> bool:
         index_equivalent_dep_names: OrderedSet[str] = OrderedSet()
         grouped_buf_names = OrderedSet(
@@ -8236,7 +8393,10 @@ class Scheduler:
             for name in grouped_node.get_buffer_names()
         )
         for sn, domain in pointwise_domains:
-            if domain is not NestedReduction.PointwiseDomain.PARENT_FULL:
+            if domain not in (
+                NestedReduction.PointwiseDomain.PARENT_FULL,
+                NestedReduction.PointwiseDomain.PARENT_HALF,
+            ):
                 continue
             reads = (
                 self.mutation_renames.get(dep.name, dep.name)
@@ -8248,6 +8408,12 @@ class Scheduler:
         # Parent-full consumers may read grouped-stage outputs through
         # broadcasted parent-tile views. Relax matching only for those named
         # producer outputs; all other deps use normal vertical legality.
+        if producer_node is not None:
+            return self.can_fuse_vertical(
+                producer_node,
+                other,
+                index_equivalent_dep_names=index_equivalent_dep_names,
+            )
         return self._can_fuse(
             grouped_node,
             other,
@@ -8326,7 +8492,9 @@ class Scheduler:
         if isinstance(node1, FusedNestedReductions):
             return node1.can_fuse_with(node2, can_reorder=can_reorder)
         if isinstance(node2, FusedNestedReductions):
-            return False
+            # Candidate scoring can present a downstream consumer first.
+            # can_fuse_with still verifies it really consumes the grouped stage.
+            return node2.can_fuse_with(node1, can_reorder=can_reorder)
 
         if isinstance(node1, FusedMixOrderReductions):
             return node1.can_fuse_with(node2)
@@ -10819,6 +10987,8 @@ class BaseScheduling:  # noqa: docstring_linter
             return FusedMixOrderReductions(node1, node2)
         elif isinstance(node1, FusedNestedReductions):
             return node1.fuse_with(node2)
+        elif isinstance(node2, FusedNestedReductions):
+            return node2.fuse_with(node1)
         elif isinstance(node1, FusedMixOrderReductions):
             return node1.fuse_with(node2)
         elif isinstance(node1, ExternKernelSchedulerNode) and isinstance(
