@@ -3667,7 +3667,15 @@ class TestCase(expecttest.TestCase):
         return CudaMemoryLeakCheck(self, name)
 
     def before_cuda_memory_leak_check(self):
-        torch._dynamo.reset()
+        self._reset_dynamo_if_imported()
+
+    @staticmethod
+    def _reset_dynamo_if_imported():
+        dynamo = sys.modules.get("torch._dynamo")
+        if dynamo is not None:
+            reset = getattr(dynamo, "reset", None)
+            if reset is not None:
+                reset()
 
     def enforceNonDefaultStream(self):
         return CudaNonDefaultStream()
@@ -3955,6 +3963,7 @@ class TestCase(expecttest.TestCase):
             )
 
     def setUp(self):
+        self._reset_dynamo_if_imported()
         check_if_enable(self)
         set_rng_seed()
 
@@ -4043,6 +4052,8 @@ class TestCase(expecttest.TestCase):
                 raise AssertionError(
                     "fp32 precision flag leak detected:\n" + "\n".join(mismatches)
                 )
+
+        self._reset_dynamo_if_imported()
 
     @staticmethod
     def _make_crow_indices(n_rows, n_cols, nnz,
