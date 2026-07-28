@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
+import functools
 import itertools
 import logging
 from collections.abc import Callable, Generator  # noqa: TC003
@@ -34,6 +36,119 @@ log = logging.getLogger(__name__)
 _ONES_ALPHA: dict = {}
 
 
+@dataclasses.dataclass(frozen=True)
+class _EpilogueABI:
+    inputs: tuple
+    input_kinds: tuple[int, ...]
+    outputs: tuple
+    output_count: int
+    primary_output: int
+
+    @classmethod
+    def from_args(cls, args, tensor_attr: str) -> _EpilogueABI:
+        outputs, output_count, primary_output = _epilogue_outputs(args, tensor_attr)
+        return cls(
+            _epilogue_tensors(args, tensor_attr),
+            _epilogue_tensor_kinds(args),
+            outputs,
+            output_count,
+            primary_output,
+        )
+
+
+@functools.lru_cache(maxsize=256)
+def _epilogue_signature(epilogue_fn) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    from cutlass.operators.fusion import trace_in_out
+
+    inputs, outputs = trace_in_out(epilogue_fn)
+    return (
+        tuple(name for name in inputs if name != "accum"),
+        tuple(outputs),
+    )
+
+
+def _epilogue_input_names(epilogue_fn) -> tuple[str, ...]:
+    return _epilogue_signature(epilogue_fn)[0]
+
+
+def _epilogue_tensors(args, attr: str) -> tuple:
+    epilogue = getattr(args, "epilogue", None)
+    tensors = (
+        ()
+        if epilogue is None
+        else tuple(
+            getattr(_epilogue_abi_tensor(epilogue.tensors[name]), attr)
+            for name in _epilogue_input_names(epilogue.epilogue_fn)
+        )
+    )
+    if len(tensors) > 4:
+        raise NotImplementedError("NVGEMM scaled epilogues support up to four inputs")
+    return tensors + (None,) * (4 - len(tensors))
+
+
+def _epilogue_abi_tensor(tensor):
+    runtime_tensor = tensor.runtime_tensor
+    leading = runtime_tensor.shape[0]
+    if leading % 8 == 0:
+        return tensor
+    from cutlass.operators.utils.tensor import TensorWrapper
+
+    padded_shape = (leading + 7) // 8 * 8, *runtime_tensor.shape[1:]
+    import torch
+
+    padded = torch.empty(
+        padded_shape,
+        dtype=runtime_tensor.dtype,
+        device=runtime_tensor.device,
+    )
+    padded[:leading].copy_(runtime_tensor)
+    return TensorWrapper(padded)
+
+
+def _epilogue_tensor_kinds(args) -> tuple[int, ...]:
+    epilogue = getattr(args, "epilogue", None)
+    if epilogue is None:
+        return (0, 0, 0, 0)
+    kinds = []
+    output_m, output_n = args.out.shape[-2:]
+    for name in _epilogue_input_names(epilogue.epilogue_fn):
+        shape = epilogue.tensors[name].shape
+        if shape[-1] == 1 and (len(shape) == 1 or shape[-2] == 1):
+            if output_n == 1:
+                kinds.append(2)
+            elif output_m == 1:
+                kinds.append(3)
+            else:
+                raise NotImplementedError(
+                    "NVGEMM scaled epilogues do not support scalar tensor inputs"
+                )
+        elif len(shape) == 1 or shape[-2] == 1:
+            kinds.append(2)
+        elif shape[-1] == 1:
+            kinds.append(3)
+        else:
+            kinds.append(1)
+    return tuple(kinds) + (0,) * (4 - len(kinds))
+
+
+def _epilogue_outputs(args, attr: str) -> tuple[tuple, int, int]:
+    epilogue = getattr(args, "epilogue", None)
+    if epilogue is None:
+        return (None, None, None), 1, 0
+    output_names = _epilogue_signature(epilogue.epilogue_fn)[1]
+    if not output_names or len(output_names) > 4:
+        raise NotImplementedError("NVGEMM scaled epilogues support 1-4 outputs")
+    if len(output_names) > 1 and "D" not in output_names:
+        raise NotImplementedError("NVGEMM scaled multi-store requires a D output")
+    primary_index = output_names.index("D") if "D" in output_names else 0
+    tensors = tuple(
+        getattr(epilogue.tensors[name], attr)
+        for index, name in enumerate(output_names)
+        if index != primary_index
+    )
+    return tensors + (None,) * (3 - len(tensors)), len(output_names), primary_index
+
+
 def _ones_alpha():
     """Cached per-device (4,)-ones alpha TensorWrapper (identity global scale).
 
@@ -51,6 +166,23 @@ def _ones_alpha():
         tw = TensorWrapper(torch.ones(4, dtype=torch.float32, device=f"cuda:{dev}"))
         _ONES_ALPHA[dev] = tw
     return tw
+
+
+def _epilogue_op_scope(cute):
+    def relu(x):
+        return cute.math.max(x, cute.full_like(x, 0.0))
+
+    def sigmoid(x):
+        return 1.0 / (1.0 + cute.math.exp(-x))
+
+    return {
+        "erf": cute.math.erf,
+        "exp": cute.math.exp,
+        "relu": relu,
+        "sigmoid": sigmoid,
+        "silu": lambda x: x * sigmoid(x),
+        "tanh": cute.math.tanh,
+    }
 
 
 try:
@@ -141,9 +273,10 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
                     for node in ast.parse(epilogue_op).body
                     if isinstance(node, ast.FunctionDef)
                 )
-                scope = {}
-                exec(epilogue_op, {}, scope)
+                scope = _epilogue_op_scope(cute)
+                exec(epilogue_op, scope)
                 epilogue_op = scope[fn_name]
+        epilogue = _EpilogueABI.from_args(args, "compile_time_tensor")
         local_reduce_out = getattr(args, "local_reduce_out", None)
         if local_reduce_out is not None:
             return self.cute_compile(
@@ -156,11 +289,18 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
                 max_active_clusters,
                 stream,
                 epilogue_op,
+                self.metadata.operands.out.dtype,
                 alpha,
+                *epilogue.inputs,
+                *epilogue.input_kinds,
+                *epilogue.outputs,
+                epilogue.output_count,
+                epilogue.primary_output,
                 local_reduce_out.compile_time_tensor,
-                getattr(args, "local_reduce_group"),
-                getattr(args, "local_reduce_axis"),
-                getattr(args, "local_reduce_type"),
+                args.local_reduce_group,
+                args.local_reduce_axis,
+                args.local_reduce_type,
+                args.local_reduce_source,
                 target_sm=target_sm,
             )
         return self.cute_compile(
@@ -173,7 +313,13 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
             max_active_clusters,
             stream,
             epilogue_op,
+            self.metadata.operands.out.dtype,
             alpha,
+            *epilogue.inputs,
+            *epilogue.input_kinds,
+            *epilogue.outputs,
+            epilogue.output_count,
+            epilogue.primary_output,
             target_sm=target_sm,
         )
 
@@ -197,6 +343,7 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
         alpha = getattr(args, "alpha", None)
         if alpha is None:
             alpha = _ones_alpha()
+        epilogue = _EpilogueABI.from_args(args, "runtime_tensor")
 
         local_reduce_out = getattr(args, "local_reduce_out", None)
         if local_reduce_out is not None:
@@ -209,6 +356,8 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
                 args.out.tensor,
                 stream,
                 alpha,
+                *epilogue.inputs,
+                *epilogue.outputs,
                 local_reduce_out.runtime_tensor,
             )
             return
@@ -222,6 +371,8 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
             args.out.tensor,
             stream,
             alpha,
+            *epilogue.inputs,
+            *epilogue.outputs,
             None,
         )
 
@@ -236,8 +387,8 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
 
         local_reduce_out = getattr(args, "local_reduce_out", None)
         if local_reduce_out is not None:
-            group = getattr(args, "local_reduce_group")
-            axis = getattr(args, "local_reduce_axis")
+            group = args.local_reduce_group
+            axis = args.local_reduce_axis
             m, n = args.out.shape[-2:]
             selected_size = n if axis == 1 else m
             max_group = 32 if axis == 1 else 4
