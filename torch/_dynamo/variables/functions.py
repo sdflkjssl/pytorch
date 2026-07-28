@@ -741,9 +741,7 @@ class UserFunctionVariable(BaseUserFunctionVariable):
             source = source and AttrSource(source, "__get__")
             return VariableTracker.build(tx, self.fn.__get__, source)
         elif name in cmp_name_to_op_mapping:
-            return variables.GetAttrVariable(
-                self, name, py_type=type(getattr(self.fn, name))
-            )
+            return variables.CallMethodVariable(self, name)
         source = self.get_source()
         return fn_getattro_impl(tx, self.fn, source, name)
 
@@ -2091,9 +2089,7 @@ class NestedUserFunctionVariable(BaseUserFunctionVariable):
             d = getattr(self, "defaults", None)
             return d.as_python_constant() if d else ConstantVariable.create(None)
         elif name in cmp_name_to_op_mapping:
-            return variables.GetAttrVariable(
-                self, name, py_type=type(getattr(types.FunctionType, name))
-            )
+            return variables.CallMethodVariable(self, name)
         else:
             return super().getattro_impl(tx, name)
 
@@ -2568,9 +2564,7 @@ class SkipFunctionVariable(VariableTracker):
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
         if name in cmp_name_to_op_mapping:
-            return variables.GetAttrVariable(
-                self, name, py_type=type(getattr(self.value, name))
-            )
+            return variables.CallMethodVariable(self, name)
 
         return fn_getattro_impl(tx, self.value, self.source, name)
 
@@ -3080,9 +3074,7 @@ class FunctoolsPartialVariable(VariableTracker):
             items = {VariableTracker.build(tx, k): v for k, v in self.keywords.items()}
             return variables.ConstDictVariable(items, source=source)
         if name in cmp_name_to_op_mapping:
-            return variables.GetAttrVariable(
-                self, name, py_type=type(getattr(functools.partial, name))
-            )
+            return variables.CallMethodVariable(self, name)
         raise_observed_exception(AttributeError, tx)
 
     def as_python_constant(self) -> Any:
@@ -4290,6 +4282,13 @@ class BoundBuiltinMethodVariable(VariableTracker):
         from .object_protocol import object_richcompare
 
         return object_richcompare(self, tx, other, op)
+
+    def getattro_impl(
+        self, tx: "InstructionTranslatorBase", name: str
+    ) -> "VariableTracker":
+        if name == "__name__":
+            return variables.ConstantVariable.create(self.descriptor.__name__)
+        return super().getattro_impl(tx, name)
 
     def as_python_constant(self) -> Any:
         obj = self.obj.as_python_constant()
